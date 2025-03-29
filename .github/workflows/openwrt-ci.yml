@@ -11,8 +11,11 @@ on:
   schedule:
     - cron: 0 20 * * *
 
-permissions:
-  contents: read
+#permissions:
+ # contents: read
+   push:
+   branches:
+          - master
 
 jobs:
 
