@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Copyright (C) 2006-2020 LEDE.org
+# Copyright (C) 2006-2020 OpenWrt.org
 
 override TARGET_BUILD=
 include $(INCLUDE_DIR)/prereq.mk
@@ -40,8 +40,8 @@ IMG_PREFIX_VERCODE:=$(if $(CONFIG_VERSION_CODE_FILENAMES),$(call sanitize,$(VERS
 IMG_PREFIX:=$(VERSION_DIST_SANITIZED)-$(IMG_PREFIX_VERNUM)$(IMG_PREFIX_VERCODE)$(IMG_PREFIX_EXTRA)$(BOARD)$(if $(SUBTARGET),-$(SUBTARGET))
 IMG_ROOTFS:=$(IMG_PREFIX)-rootfs
 IMG_COMBINED:=$(IMG_PREFIX)-combined
-IMG_PART_SIGNATURE:=$(shell echo $(SOURCE_DATE_EPOCH)$(LINUX_VERMAGIC) | $(MKHASH) md5 | cut -b1-8)
-IMG_PART_DISKGUID:=$(shell echo $(SOURCE_DATE_EPOCH)$(LINUX_VERMAGIC) | $(MKHASH) md5 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{10})../\1-\2-\3-\4-\500/')
+IMG_PART_SIGNATURE:=$(shell echo '$(SOURCE_DATE_EPOCH)$(LINUX_VERMAGIC)' | $(MKHASH) md5 | cut -b1-8)
+IMG_PART_DISKGUID:=$(shell echo '$(SOURCE_DATE_EPOCH)$(LINUX_VERMAGIC)' | $(MKHASH) md5 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{10})../\1-\2-\3-\4-\500/')
 
 MKFS_DEVTABLE_OPT := -D $(INCLUDE_DIR)/device_table.txt
 
@@ -87,11 +87,21 @@ endif
 
 JFFS2_BLOCKSIZE ?= 64k 128k
 
+EROFS_PCLUSTERSIZE = $(shell echo $$(($(CONFIG_TARGET_EROFS_PCLUSTER_SIZE)*1024)))
+EROFSOPT := -Efragments,dedupe,ztailpacking -Uclear --all-root
+EROFSOPT += $(if $(SOURCE_DATE_EPOCH),-T$(SOURCE_DATE_EPOCH) --ignore-mtime)
+EROFSOPT += $(if $(CONFIG_SELINUX),,-x-1)
+EROFSCOMP := lz4hc,12
+ifeq ($(CONFIG_EROFS_FS_ZIP_LZMA),y)
+EROFSCOMP := lzma,109
+endif
+
 fs-types-$(CONFIG_TARGET_ROOTFS_SQUASHFS) += squashfs
 fs-types-$(CONFIG_TARGET_ROOTFS_JFFS2) += $(addprefix jffs2-,$(JFFS2_BLOCKSIZE))
 fs-types-$(CONFIG_TARGET_ROOTFS_JFFS2_NAND) += $(addprefix jffs2-nand-,$(NAND_BLOCKSIZE))
 fs-types-$(CONFIG_TARGET_ROOTFS_EXT4FS) += ext4
 fs-types-$(CONFIG_TARGET_ROOTFS_UBIFS) += ubifs
+fs-types-$(CONFIG_TARGET_ROOTFS_EROFS) += erofs
 fs-subtypes-$(CONFIG_TARGET_ROOTFS_JFFS2) += $(addsuffix -raw,$(addprefix jffs2-,$(JFFS2_BLOCKSIZE)))
 
 TARGET_FILESYSTEMS := $(fs-types-y)
@@ -275,9 +285,21 @@ define Image/mkfs/ext4
 		$@ $(call mkfs_target_dir,$(1))/
 endef
 
+# Don't use the mkfs.erofs builtin $SOURCE_DATE_EPOCH behavior
+define Image/mkfs/erofs
+	env -u SOURCE_DATE_EPOCH $(STAGING_DIR_HOST)/bin/mkfs.erofs -z$(EROFSCOMP) \
+		-C$(EROFS_PCLUSTERSIZE) $(EROFSOPT) \
+		$@ $(call mkfs_target_dir,$(1))
+endef
+
 define Image/Manifest
-	$(call opkg,$(TARGET_DIR_ORIG)) list-installed > \
-		$(BIN_DIR)/$(IMG_PREFIX)$(if $(PROFILE_SANITIZED),-$(PROFILE_SANITIZED)).manifest
+	$(if $(CONFIG_USE_APK), \
+		$(call apk,$(TARGET_DIR_ORIG)) list --quiet --manifest --no-network \
+			--repositories-file /dev/null | sort | sed 's/ / - /'  > \
+			$(BIN_DIR)/$(IMG_PREFIX)$(if $(PROFILE_SANITIZED),-$(PROFILE_SANITIZED)).manifest, \
+		$(call opkg,$(TARGET_DIR_ORIG)) list-installed > \
+			$(BIN_DIR)/$(IMG_PREFIX)$(if $(PROFILE_SANITIZED),-$(PROFILE_SANITIZED)).manifest \
+	)
 endef
 
 define Image/gzip-ext4-padded-squashfs
@@ -320,7 +342,20 @@ opkg_target = \
 	$(call opkg,$(mkfs_cur_target_dir)) \
 		-f $(mkfs_cur_target_dir).conf
 
+apk_target = \
+	$(call apk,$(mkfs_cur_target_dir)) --no-scripts \
+		--repositories-file /dev/null --repository file://$(PACKAGE_DIR_ALL)/packages.adb
+
+
 target-dir-%: FORCE
+ifneq ($(CONFIG_USE_APK),)
+	rm -rf $(mkfs_cur_target_dir)
+	$(CP) $(TARGET_DIR_ORIG) $(mkfs_cur_target_dir)
+	$(if $(mkfs_packages_remove), \
+		-$(apk_target) del $(mkfs_packages_remove))
+	$(if $(mkfs_packages_add), \
+		$(apk_target) add $(mkfs_packages_add))
+else
 	rm -rf $(mkfs_cur_target_dir) $(mkfs_cur_target_dir).opkg
 	$(CP) $(TARGET_DIR_ORIG) $(mkfs_cur_target_dir)
 	-mv $(mkfs_cur_target_dir)/etc/opkg $(mkfs_cur_target_dir).opkg
@@ -334,6 +369,7 @@ target-dir-%: FORCE
 			$(call opkg_package_files,$(mkfs_packages_add)))
 	-$(CP) -T $(mkfs_cur_target_dir).opkg/ $(mkfs_cur_target_dir)/etc/opkg/
 	rm -rf $(mkfs_cur_target_dir).opkg $(mkfs_cur_target_dir).conf
+endif
 	$(call prepare_rootfs,$(mkfs_cur_target_dir),$(TOPDIR)/files)
 
 $(KDIR)/root.%: kernel_prepare
@@ -425,6 +461,9 @@ define Device/Init
   SUPPORTED_DEVICES := $(subst _,$(comma),$(1))
   IMAGE_METADATA :=
 
+  ##@ Filesystems to build images for.
+  # Set FILESYSTEMS/<image> to build an image for only some of them.
+  ##
   FILESYSTEMS := $(TARGET_FILESYSTEMS)
 
   UBOOT_PATH :=  $(STAGING_DIR_IMAGE)/uboot-$(1)
@@ -502,9 +541,9 @@ define Device/Build/initramfs
 
   $(KDIR)/$$(KERNEL_INITRAMFS_NAME):: image_prepare
   $(1)-images: $$(if $$(KERNEL_INITRAMFS),$(BIN_DIR)/$$(KERNEL_INITRAMFS_IMAGE))
-  
+
   .IGNORE: $(BIN_DIR)/$$(KERNEL_INITRAMFS_IMAGE)
-  
+
   $(BIN_DIR)/$$(KERNEL_INITRAMFS_IMAGE): $(KDIR)/tmp/$$(KERNEL_INITRAMFS_IMAGE)
 	cp $$^ $$@
 
@@ -639,8 +678,11 @@ define Device/Build/image
 
   .IGNORE: $(BIN_DIR)/$(call DEVICE_IMG_NAME,$(1),$(2))
 
-  $(BIN_DIR)/$(call DEVICE_IMG_NAME,$(1),$(2)).gz: $(KDIR)/tmp/$(call DEVICE_IMG_NAME,$(1),$(2))
+  $(KDIR)/tmp/$(call DEVICE_IMG_NAME,$(1),$(2)).gz: $(KDIR)/tmp/$(call DEVICE_IMG_NAME,$(1),$(2))
 	gzip -c -9n $$^ > $$@
+
+  $(BIN_DIR)/$(call DEVICE_IMG_NAME,$(1),$(2)).gz: $(KDIR)/tmp/$(call DEVICE_IMG_NAME,$(1),$(2)).gz
+	cp $$^ $$@
 
   $(BIN_DIR)/$(call DEVICE_IMG_NAME,$(1),$(2)): $(KDIR)/tmp/$(call DEVICE_IMG_NAME,$(1),$(2))
 	cp $$^ $$@
@@ -649,7 +691,7 @@ define Device/Build/image
 	@mkdir -p $$(shell dirname $$@)
 	DEVICE_ID="$(DEVICE_NAME)" \
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
-	FILE_NAME="$(DEVICE_IMG_NAME)" \
+	FILE_NAME="$$(notdir $$^)" \
 	FILE_DIR="$(KDIR)/tmp" \
 	FILE_TYPE=$(word 1,$(subst ., ,$(2))) \
 	FILE_FILESYSTEM="$(1)" \
@@ -742,7 +784,8 @@ define Device/Build
     $$(call Device/Build/compile,$$(compile),$(1))))
 
   $$(eval $$(foreach image,$$(IMAGES), \
-    $$(foreach fs,$$(filter $(TARGET_FILESYSTEMS),$$(FILESYSTEMS)), \
+    $$(foreach fs,$$(filter $(TARGET_FILESYSTEMS), \
+        $$(filter $$(or $$(FILESYSTEMS/$$(image)),$$(FILESYSTEMS)),$$(FILESYSTEMS))), \
       $$(call Device/Build/image,$$(fs),$$(image),$(1)))))
 
   $$(eval $$(foreach artifact,$$(ARTIFACTS), \
